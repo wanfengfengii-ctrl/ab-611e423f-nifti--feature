@@ -9,16 +9,18 @@ BOUNDARY = "nifti-verify-7f3a9c51e2b44d08a1"
 
 
 def build_multipart(file_bytes, points, *, file_field="file",
-                    filename="vol.nii", points_field="points"):
+                    filename="vol.nii", points_field="points",
+                    derivatives=None):
     """Assemble a multipart/form-data body with one file part and one
     ``points`` field.  ``points`` may be a Python object (JSON-encoded) or
-    raw bytes/str (sent as-is, for malformed-input tests)."""
+    raw bytes/str (sent as-is, for malformed-input tests).  When given,
+    ``derivatives`` adds a plain form field (e.g. ``"world_gradient"``)."""
     if not isinstance(points, (bytes, str)):
         points = json.dumps(points)
     if isinstance(points, str):
         points = points.encode("utf-8")
     boundary = BOUNDARY.encode("ascii")
-    return b"\r\n".join([
+    segments = [
         b"--" + boundary,
         b'Content-Disposition: form-data; name="%s"; filename="%s"'
         % (file_field.encode("utf-8"), filename.encode("utf-8")),
@@ -30,19 +32,31 @@ def build_multipart(file_bytes, points, *, file_field="file",
         b"Content-Type: application/json",
         b"",
         points,
+    ]
+    if derivatives is not None:
+        if isinstance(derivatives, str):
+            derivatives = derivatives.encode("utf-8")
+        segments += [
+            b"--" + boundary,
+            b'Content-Disposition: form-data; name="derivatives"',
+            b"",
+            derivatives,
+        ]
+    segments += [
         b"--" + boundary + b"--",
         b"",
-    ])
+    ]
+    return b"\r\n".join(segments)
 
 
-def post_sample(base_url, file_bytes, points, *, timeout=30):
+def post_sample(base_url, file_bytes, points, *, timeout=30, derivatives=None):
     """POST /api/nifti/sample; returns ``(status, parsed_json_or_None)``."""
     url = urlsplit(base_url)
     conn = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=timeout)
     try:
         conn.request(
             "POST", "/api/nifti/sample",
-            body=build_multipart(file_bytes, points),
+            body=build_multipart(file_bytes, points, derivatives=derivatives),
             headers={"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"},
         )
         resp = conn.getresponse()

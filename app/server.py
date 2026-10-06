@@ -2,7 +2,9 @@
 
 The multipart form carries exactly one NIfTI-1 .nii file (<= 16 MiB) and a
 ``points`` JSON field with 1..256 uniquely-numbered finite 3D coordinates.
-See README.md for the full API contract.
+An optional ``derivatives`` form field selects per-point derivatives
+(currently only ``world_gradient``).  See README.md for the full API
+contract.
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .errors import ApiError, PointError
 from .nifti import NiftiVolume, parse_nifti
-from .sampling import sample_point
+from .sampling import sample_point, world_gradient
 
 log = logging.getLogger("nifti_sampler")
 
@@ -24,6 +26,9 @@ MAX_BODY_BYTES = MAX_FILE_BYTES + 1024 * 1024    # file + multipart overhead
 MAX_POINTS = 256
 SAMPLE_PATH = "/api/nifti/sample"
 HEALTH_PATH = "/healthz"
+
+# Accepted values of the optional ``derivatives`` form field.
+DERIVATIVES = ("world_gradient",)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +140,30 @@ def parse_points(raw):
             xyz.append(float(c))
         points.append((pid, tuple(xyz)))
     return points
+
+
+# ---------------------------------------------------------------------------
+# derivatives field parsing
+# ---------------------------------------------------------------------------
+
+def parse_derivatives(raw):
+    """Validate the optional ``derivatives`` form field.
+
+    Only the literal value ``world_gradient`` is accepted; returns the set
+    of selected derivative names.
+    """
+    try:
+        value = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise ApiError("invalid_derivatives",
+                       "derivatives field is not valid UTF-8 text",
+                       field="derivatives")
+    if value not in DERIVATIVES:
+        raise ApiError("invalid_derivatives",
+                       f"unsupported derivatives value {value!r}; supported "
+                       f"values: {', '.join(DERIVATIVES)}",
+                       field="derivatives")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +305,14 @@ class Handler(BaseHTTPRequestHandler):
                            field="points")
         if len(point_parts) > 1:
             raise ApiError("invalid_multipart", "multiple 'points' fields")
+        derivative_parts = [p for p in parts
+                            if p.name == "derivatives" and p.filename is None]
+        if len(derivative_parts) > 1:
+            raise ApiError("invalid_multipart", "multiple 'derivatives' fields")
+        want_gradient = False
+        if derivative_parts:
+            want_gradient = parse_derivatives(derivative_parts[0].content) == \
+                "world_gradient"
 
         content = files[0].content
         if len(content) > MAX_FILE_BYTES:
@@ -291,6 +328,9 @@ class Handler(BaseHTTPRequestHandler):
         for pid, coord in points:
             try:
                 voxel, intensity = sample_point(volume, coord)
+                gradient = None
+                if want_gradient:
+                    gradient = list(world_gradient(volume, voxel))
             except PointError as err:
                 entry = {"id": pid, "status": "error",
                          "error": {"code": err.code, "message": err.message}}
@@ -298,9 +338,12 @@ class Handler(BaseHTTPRequestHandler):
                     entry["error"]["voxel"] = list(err.voxel)
                 results.append(entry)
             else:
-                results.append({"id": pid, "status": "ok",
-                                "voxel": list(voxel), "intensity": intensity,
-                                "transform": volume.transform})
+                entry = {"id": pid, "status": "ok",
+                         "voxel": list(voxel), "intensity": intensity,
+                         "transform": volume.transform}
+                if want_gradient:
+                    entry["gradient"] = gradient
+                results.append(entry)
         self._send_json(200, {"transform": volume.transform, "results": results})
 
 
@@ -324,6 +367,9 @@ def self_check():
     (_, center) = sample_point(vol, (0.5, 0.5, 0.5))
     if abs(center - 3.5) > 1e-12:
         raise RuntimeError(f"self-check center sample failed: {center}")
+    grad = world_gradient(vol, (0.5, 0.5, 0.5))
+    if any(abs(g - want) > 1e-12 for g, want in zip(grad, (1.0, 2.0, 4.0))):
+        raise RuntimeError(f"self-check gradient failed: {grad}")
 
 
 def main():

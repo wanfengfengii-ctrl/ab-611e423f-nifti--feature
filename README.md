@@ -14,6 +14,7 @@
 | --- | --- |
 | 文件部分（任意字段名，须带 `filename`） | 单个 NIfTI-1 `.nii` 文件，≤ 16 MiB |
 | `points` 字段 | JSON 数组，1–256 个元素：`[{"id": 0, "point": [x, y, z]}, ...]` |
+| `derivatives` 字段（可选） | 目前仅接受字面量 `world_gradient`；省略时请求、响应与错误完全不变 |
 
 `id` 为 `[0, 2^31)` 内唯一整数；`point` 为三个有限数值（RAS 世界坐标，
 单位与文件仿射一致，通常为 mm）。
@@ -21,6 +22,12 @@
 ```bash
 curl -F "file=@vol.nii" \
      -F 'points=[{"id": 1, "point": [12.0, 26.0, 42.0]}]' \
+     http://localhost:8000/api/nifti/sample
+
+# 需要世界方向梯度时加上 derivatives 字段
+curl -F "file=@vol.nii" \
+     -F 'points=[{"id": 1, "point": [12.0, 26.0, 42.0]}]' \
+     -F "derivatives=world_gradient" \
      http://localhost:8000/api/nifti/sample
 ```
 
@@ -31,7 +38,8 @@ curl -F "file=@vol.nii" \
   "transform": "sform",
   "results": [
     {"id": 1, "status": "ok", "voxel": [1.0, 2.0, 3.0],
-     "intensity": 647.0, "transform": "sform"},
+     "intensity": 647.0, "transform": "sform",
+     "gradient": [0.5, 3.33, 25.0]},
     {"id": 2, "status": "error",
      "error": {"code": "out_of_bounds", "message": "...",
                "voxel": [-5.0, -6.67, -7.5]}}
@@ -43,6 +51,22 @@ curl -F "file=@vol.nii" \
 `scl_slope`/`scl_inter` 缩放）、所用变换来源（`transform`，
 `sform` 或 `qform`）。越界点、非有限数据以**逐点错误**返回，不影响其余点。
 
+`derivatives=world_gradient` 时，每个成功点额外给出 `gradient`：按
+**R、A、S 顺序**排列的有限梯度三元组，表示该点局部三线性强度场相对
+*世界坐标*（而非体素轴）的变化率。计算方式为：先对所选三线性单元做体素轴
+有限差分（已计入 `scl_slope` 强度缩放），再经所选 sform/qform 仿射的逆
+转置映射到世界方向，`g_world = M^{-T} g_voxel`，因此对角仿射下分量即
+“缩放后的体素梯度 ÷ 体素尺寸”，旋转仿射下分量会混合轴别，不会把体素轴
+梯度误报成 RAS 方向。单元选择规则：
+
+- 点恰落在某个体素分界（体素坐标为整数的内部节点）时取**负体素侧**单元
+  `[i-1, i]`（在末节点即 `[n-2, n-1]`）；
+- 零侧边界（体素坐标 0）没有负侧单元，改取**正侧**单元 `[0, 1]`；
+- 该轴仅一个体素（`n=1`）时，对应梯度分量为 0；
+- 梯度所需 2×2×2 邻域内任一缩放后数据非有限时，**仅该点**返回可定位的
+  逐点错误 `non_finite_gradient`（携带连续体素坐标与问题体素下标），其余
+  点照常给出强度、连续体素坐标、变换来源与梯度。
+
 ### 错误
 
 文件/请求级错误返回 4xx，JSON 形如
@@ -53,6 +77,7 @@ curl -F "file=@vol.nii" \
 | `invalid_multipart` | 400/415 | — | 表单结构非法 |
 | `missing_file` / `multiple_files` | 400 | `file` | 文件部分缺失/多于一个 |
 | `missing_points` / `invalid_points` | 400 | `points` | 坐标字段缺失、数量越界、id 重复/非法、坐标非有限（message 含点号） |
+| `invalid_derivatives` | 400 | `derivatives` | `derivatives` 取值不支持（仅支持 `world_gradient`） |
 | `file_too_large` | 413 | `file` | 超过 16 MiB |
 | `header_too_short` | 400 | `file` | 不足 348 字节头部 |
 | `bad_sizeof_hdr` | 400 | `sizeof_hdr` | 两种字节序下都不是 348 |
@@ -70,7 +95,9 @@ curl -F "file=@vol.nii" \
 | `singular_affine` | 400 | `srow`/`qform` | 所选仿射不可逆 |
 
 逐点错误（200 响应内）：`out_of_bounds`（逆变换后落在体素中心闭域
-`[0, n-1]` 之外）、`non_finite_data`（插值邻域内缩放后数据非有限）。
+`[0, n-1]` 之外）、`non_finite_data`（插值邻域内缩放后数据非有限）、
+`non_finite_gradient`（仅请求 `world_gradient` 时可能出现：梯度单元
+2×2×2 邻域内存在非有限数据；采样本身成功、只有梯度无法计算时也用此码）。
 
 ### `GET /healthz`
 
@@ -89,6 +116,9 @@ curl -F "file=@vol.nii" \
 - 世界坐标经所选仿射的逆变换映射到连续体素坐标，须落在体素中心闭域
   `[0, n-1]`（各轴，含边界；另有 1e-6 体素的浮点容差）。对缩放后的 8 个
   邻近体素做三线性插值；边界轴固定到唯一端点（权重 1），零权重邻居不参与。
+- 世界梯度（`derivatives=world_gradient`）在同一三线性场上以体素轴有限差分
+  计算，并经 `g_world = M^{-T} g_voxel` 映射到 RAS 世界方向；分界点取负侧
+  单元、零侧取正侧、单体素轴分量为 0（详见 API 一节）。
 
 ## 运行
 
@@ -117,7 +147,7 @@ docker compose up --build --exit-code-from verify verify
 | --- | --- | --- |
 | bit0 | 1 | 代码测试（`tests/` 单元 + 集成测试） |
 | bit1 | 2 | 镜像构建校验（构建清单、运行时版本、模块导入、采样自检） |
-| bit2 | 4 | API 冒烟（大/小端 × sform/qform × int16/float32 样本矩阵 + 结构错误与逐点错误用例） |
+| bit2 | 4 | API 冒烟（大/小端 × sform/qform × int16/float32 样本矩阵 + 结构错误与逐点错误用例 + 强度缩放与梯度边界，含单体素轴、两类仿射与非有限梯度邻域） |
 
 退出码 0 表示全部通过。本地复现（stage 2 需要镜像构建清单
 `image-manifest.json`，仅在 Dockerfile 构建时生成）：

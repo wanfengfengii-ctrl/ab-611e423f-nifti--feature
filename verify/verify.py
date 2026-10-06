@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 
 from verify.httpclient import post_sample  # noqa: E402
 from verify.nifti_gen import build_nifti  # noqa: E402
+from app.nifti import invert_affine  # noqa: E402
 
 EXIT_TESTS = 1
 EXIT_IMAGE = 2
@@ -266,6 +267,116 @@ def stage_smoke(base_url):
           r11.get("status") == "ok"
           and abs((r11.get("intensity") or 0.0) - data_fn(3, 4, 5)) <= 1e-3,
           repr(r11))
+
+    # -- world gradient: endianness x transform, scaling, boundaries --------
+    def world_gradient_expected(affine):
+        # raw voxel gradient of data_fn=i+10j+100k is (1,10,100); scaling by
+        # SLOPE gives (2,20,200); g_world = M^{-T} g_voxel.
+        gv = [SLOPE * v for v in (1.0, 10.0, 100.0)]
+        inv = invert_affine([[*affine[r][:3], 0.0] for r in range(3)]
+                            + [[0.0, 0.0, 0.0, 1.0]], field="expected")
+        # g_world = M^{-T} g_voxel -> component r sums inv[c][r] * gv[c]
+        return tuple(sum(inv[c][r] * gv[c] for c in range(3)) for r in range(3))
+
+    for endian, transform in ((e, t) for e in ("<", ">")
+                              for t in ("sform", "qform")):
+        tag = f"{'LE' if endian == '<' else 'BE'}/{transform}/gradient"
+        affine = SFORM_AFFINE if transform == "sform" else QFORM_AFFINE
+        raw = build_nifti(
+            endian=endian, datatype="float32", dims=DIMS, data_fn=data_fn,
+            transform=transform, slope=SLOPE, inter=INTER,
+            srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1], srow_z=SFORM_AFFINE[2],
+            quatern=QUATERN_90Z, qoffset=(10.0, 20.0, 30.0),
+            pixdim=(1.0, 2.0, 3.0, 4.0),
+        )
+        # zero-side boundary, interior and negative-side far boundary
+        voxels = {20: (0.0, 0.0, 0.0), 21: (1.0, 2.0, 3.0),
+                  22: (3.0, 4.0, 5.0)}
+        points = [{"id": pid, "point": list(world_of(affine, v))}
+                  for pid, v in voxels.items()]
+        want = world_gradient_expected(affine)
+        status, payload = post_sample(base_url, raw, points,
+                                      derivatives="world_gradient")
+        results = {r.get("id"): r for r in payload.get("results", [])} \
+            if isinstance(payload, dict) else {}
+        check(f"{tag}: HTTP 200", status == 200, f"got {status}: {payload}")
+        for pid in voxels:
+            r = results.get(pid, {})
+            grad = r.get("gradient")
+            ok = (r.get("status") == "ok" and isinstance(grad, list)
+                  and len(grad) == 3
+                  and all(abs(g - w) <= 1e-3 for g, w in zip(grad, want)))
+            check(f"{tag}: id {pid} RAS gradient", ok,
+                  f"want {want}, got {grad!r}")
+
+    # gradient boundary with a non-linear datum: NaN only affects a point
+    # whose gradient neighbourhood contains it
+    grad_raw = build_nifti(**{**base,
+                              "data_fn": lambda i, j, k: float("nan")
+                              if (i, j, k) == (1, 1, 1) else data_fn(i, j, k)})
+    points = [
+        {"id": 20, "point": list(world_of(SFORM_AFFINE, (0.0, 0.0, 0.0)))},
+        {"id": 21, "point": list(world_of(SFORM_AFFINE, (3.0, 4.0, 5.0)))},
+        {"id": 22, "point": list(world_of(SFORM_AFFINE, (-1.0, 0.0, 0.0)))},
+    ]
+    status, payload = post_sample(base_url, grad_raw, points,
+                                  derivatives="world_gradient")
+    results = {r.get("id"): r for r in payload.get("results", [])} \
+        if isinstance(payload, dict) else {}
+    check("gradient: NaN neighbour is per-point locatable error",
+          status == 200
+          and results.get(20, {}).get("status") == "error"
+          and results[20].get("error", {}).get("code") == "non_finite_gradient"
+          and "voxel" in results[20].get("error", {}),
+          f"got {status}: {payload}")
+    r21 = results.get(21, {})
+    check("gradient: far-boundary point unaffected by NaN outside its cell",
+          r21.get("status") == "ok" and isinstance(r21.get("gradient"), list)
+          and len(r21["gradient"]) == 3, repr(r21))
+    check("gradient: out-of-bounds point carries no gradient",
+          results.get(22, {}).get("status") == "error"
+          and "gradient" not in results.get(22, {}), repr(results.get(22)))
+
+    # interior voxel node (i=1) takes the negative-side cell: with f(i)=i^2
+    # the left finite difference is f(1)-f(0)=1 (positive side would give 3),
+    # and the positive-side voxel (i=2) must not even be read.
+    sq_raw = build_nifti(**{**base, "data_fn": lambda i, j, k: float(i * i)})
+    point = [{"id": 1, "point": list(world_of(SFORM_AFFINE, (1.0, 0.0, 0.0)))}]
+    status, payload = post_sample(base_url, sq_raw, point,
+                                  derivatives="world_gradient")
+    r = (payload.get("results") or [{}])[0] if isinstance(payload, dict) else {}
+    grad = r.get("gradient")
+    check("gradient: interior node uses negative-side cell",
+          status == 200 and r.get("status") == "ok"
+          and grad is not None
+          and abs(grad[0] - 0.5) <= 1e-3 and abs(grad[1]) <= 1e-3
+          and abs(grad[2]) <= 1e-3, repr(r))
+    sq_nan = build_nifti(**{**base,
+                            "data_fn": lambda i, j, k: float("nan")
+                            if (i, j, k) == (2, 0, 0) else float(i * i)})
+    status, payload = post_sample(base_url, sq_nan, point,
+                                  derivatives="world_gradient")
+    r = (payload.get("results") or [{}])[0] if isinstance(payload, dict) else {}
+    check("gradient: positive-side voxel not read at interior node",
+          status == 200 and r.get("status") == "ok", f"got {status}: {payload}")
+
+    # omitted derivatives: response shape unchanged
+    status, payload = post_sample(base_url, build_nifti(**base),
+                                  [{"id": 1,
+                                    "point": list(world_of(SFORM_AFFINE, (1.0, 1.0, 1.0)))}])
+    r = (payload.get("results") or [{}])[0] if isinstance(payload, dict) else {}
+    check("gradient: absent when derivatives omitted",
+          status == 200 and "gradient" not in r, repr(r))
+
+    # invalid derivatives value is a request-level error
+    status, payload = post_sample(base_url, build_nifti(**base),
+                                  [{"id": 1,
+                                    "point": list(world_of(SFORM_AFFINE, (1.0, 1.0, 1.0)))}],
+                                  derivatives=b"voxel_gradient")
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    check("gradient: invalid derivatives -> 400/invalid_derivatives",
+          status == 400 and err.get("code") == "invalid_derivatives"
+          and err.get("field") == "derivatives", f"got {status}: {payload}")
 
     # -- invalid points payloads ---------------------------------------------
     raw = build_nifti(**base)

@@ -129,6 +129,111 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error"]["code"], "non_finite_data")
 
+    # -- world gradient --------------------------------------------------------
+    def test_gradient_absent_without_derivatives(self):
+        points = [{"id": 1, "point": world_of((1.0, 1.0, 1.0))}]
+        status, payload = post_sample(self.base, sform_file(), points)
+        self.assertEqual(status, 200)
+        (result,) = payload["results"]
+        self.assertNotIn("gradient", result)
+
+    def test_gradient_sform_scaled(self):
+        raw = sform_file(slope=2.0, inter=5.0)
+        points = [{"id": 1, "point": world_of((0.5, 0.5, 0.5))}]
+        status, payload = post_sample(self.base, raw, points,
+                                      derivatives="world_gradient")
+        self.assertEqual(status, 200)
+        (result,) = payload["results"]
+        self.assertEqual(result["status"], "ok")
+        gradient = result["gradient"]
+        self.assertEqual(len(gradient), 3)
+        # raw voxel gradient (1,10,100) * slope 2 -> (2,20,200); / zooms
+        for got, want in zip(gradient, (1.0, 20.0 / 3.0, 50.0)):
+            self.assertAlmostEqual(got, want, places=4)
+
+    def test_gradient_qform_big_endian(self):
+        quat = (0.0, 0.0, math.sqrt(0.5))  # rotz(+90 deg)
+        raw = build_nifti(endian=">", datatype="float32", dims=(4, 5, 6),
+                          data_fn=data_fn, transform="qform",
+                          quatern=quat, qoffset=(10.0, 20.0, 30.0),
+                          pixdim=(1.0, 2.0, 3.0, 4.0))
+        world = [0.0 * 1 - 3.0 * 2 + 10.0, 2.0 * 1 + 20.0, 4.0 * 3 + 30.0]
+        status, payload = post_sample(self.base, raw,
+                                      [{"id": 1, "point": world}],
+                                      derivatives="world_gradient")
+        self.assertEqual(status, 200)
+        (result,) = payload["results"]
+        self.assertEqual(result["status"], "ok")
+        for got, want in zip(result["gradient"], (-10.0 / 3.0, 0.5, 25.0)):
+            self.assertAlmostEqual(got, want, places=3)
+
+    def test_gradient_boundary_and_single_voxel_axis(self):
+        # far boundary of the (4,5,6) volume: negative-side cell (2..3, ...)
+        points = [{"id": 1, "point": world_of((3.0, 4.0, 5.0))}]
+        status, payload = post_sample(self.base, sform_file(), points,
+                                      derivatives="world_gradient")
+        self.assertEqual(status, 200)
+        result = payload["results"][0]
+        for got, want in zip(result["gradient"], (0.5, 10.0 / 3.0, 25.0)):
+            self.assertAlmostEqual(got, want, places=4)
+
+        # one-voxel-thick axis: its world-gradient component is zero
+        raw1 = build_nifti(endian="<", datatype="int16", dims=(1, 5, 6),
+                           data_fn=data_fn, transform="sform",
+                           srow_x=(2, 0, 0, 10), srow_y=(0, 3, 0, 20),
+                           srow_z=(0, 0, 4, 30))
+        status, payload = post_sample(self.base, raw1,
+                                      [{"id": 1, "point": [10.0, 23.0, 34.0]}],
+                                      derivatives="world_gradient")
+        self.assertEqual(status, 200)
+        result = payload["results"][0]
+        self.assertEqual(result["status"], "ok")
+        self.assertAlmostEqual(result["gradient"][0], 0.0, places=6)
+
+    def test_gradient_non_finite_neighbour_is_per_point_error(self):
+        # NaN at (1,1,1): sampling point 10 at (0,0,0) succeeds but its
+        # gradient neighbourhood includes the NaN; point 11 is unaffected.
+        raw = sform_file(datatype="float32",
+                         data_fn=lambda i, j, k: float("nan")
+                         if (i, j, k) == (1, 1, 1) else data_fn(i, j, k))
+        points = [
+            {"id": 10, "point": world_of((0.0, 0.0, 0.0))},
+            {"id": 11, "point": world_of((3.0, 4.0, 5.0))},
+        ]
+        status, payload = post_sample(self.base, raw, points,
+                                      derivatives="world_gradient")
+        self.assertEqual(status, 200)
+        by_id = {r["id"]: r for r in payload["results"]}
+        r10, r11 = by_id[10], by_id[11]
+        self.assertEqual(r10["status"], "error")
+        self.assertEqual(r10["error"]["code"], "non_finite_gradient")
+        self.assertIn("voxel", r10["error"])
+        self.assertEqual(r11["status"], "ok")
+        self.assertIn("gradient", r11)
+        self.assertEqual(len(r11["gradient"]), 3)
+
+    def test_invalid_derivatives_value(self):
+        raw = sform_file()
+        points = [{"id": 1, "point": world_of((1.0, 1.0, 1.0))}]
+        body = build_multipart(raw, points, derivatives=b"voxel_gradient")
+        status, payload = self.post_raw(
+            body, f"multipart/form-data; boundary={BOUNDARY}")
+        self.assert_error(status, payload, 400, "invalid_derivatives",
+                          "derivatives")
+
+    def test_multiple_derivatives_fields(self):
+        raw = sform_file()
+        points = [{"id": 1, "point": world_of((1.0, 1.0, 1.0))}]
+        body = build_multipart(raw, points, derivatives="world_gradient")
+        extra = (b"--" + BOUNDARY.encode() + b"\r\n"
+                 b'Content-Disposition: form-data; name="derivatives"\r\n\r\n'
+                 b"world_gradient\r\n")
+        body = body.replace(b"--" + BOUNDARY.encode() + b"--\r\n",
+                            extra + b"--" + BOUNDARY.encode() + b"--\r\n")
+        status, payload = self.post_raw(
+            body, f"multipart/form-data; boundary={BOUNDARY}")
+        self.assert_error(status, payload, 400, "invalid_multipart")
+
     # -- structural errors -----------------------------------------------------
     def assert_error(self, status, payload, want_status, code, field=None):
         self.assertEqual(status, want_status, payload)
