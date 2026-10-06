@@ -1,9 +1,10 @@
 """Trilinear interpolation and domain tests for app.sampling."""
+import math
 import unittest
 
 from app.errors import PointError
 from app.nifti import parse_nifti
-from app.sampling import sample_point
+from app.sampling import sample_point, sample_point_gradient
 from verify.nifti_gen import build_nifti
 
 
@@ -120,6 +121,89 @@ class TransformMappingTests(unittest.TestCase):
         for got, want in zip(voxel, (0.5, 0.5, 0.5)):
             self.assertAlmostEqual(got, want, places=6)
         self.assertAlmostEqual(value, 55.5)
+
+
+class GradientTests(unittest.TestCase):
+    def test_linear_data_constant_gradient_identity_affine(self):
+        vol = make_vol(dims=(3, 3, 3), data_fn=lambda i, j, k: i + 2 * j + 4 * k)
+        for point in ((0.5, 0.5, 0.5), (1.0, 1.0, 1.0), (2.0, 2.0, 2.0)):
+            _, _, grad = sample_point_gradient(vol, point)
+            self.assertEqual(grad, (1.0, 2.0, 4.0))
+
+    def test_exact_boundary_takes_negative_side_cell(self):
+        # values 0, 1, 4, 9 along i; the chosen cell decides d(i^2)/di
+        vol = make_vol(dims=(4, 1, 1), data_fn=lambda i, j, k: i * i)
+        cases = [
+            ((0.0, 0.0, 0.0), 1.0),  # zero boundary -> positive cell (0, 1)
+            ((0.5, 0.0, 0.0), 1.0),  # mid cell (0, 1)
+            ((1.0, 0.0, 0.0), 1.0),  # exact boundary -> negative cell (0, 1)
+            ((1.5, 0.0, 0.0), 3.0),  # mid cell (1, 2)
+            ((2.0, 0.0, 0.0), 3.0),  # exact boundary -> negative cell (1, 2)
+            ((3.0, 0.0, 0.0), 5.0),  # top boundary -> negative cell (2, 3)
+        ]
+        for point, want in cases:
+            with self.subTest(point=point):
+                _, _, grad = sample_point_gradient(vol, point)
+                # single-voxel axes (ny = nz = 1) contribute zero components
+                self.assertEqual(grad, (want, 0.0, 0.0))
+
+    def test_gradient_includes_scaling(self):
+        vol = make_vol(dims=(3, 3, 3), data_fn=linear_fn, datatype="int16",
+                       slope=2.0, inter=5.0)
+        _, intensity, grad = sample_point_gradient(vol, (1.0, 1.0, 1.0))
+        self.assertEqual(intensity, 111.0 * 2.0 + 5.0)
+        self.assertEqual(grad, (2.0, 20.0, 200.0))  # inter drops out
+
+    def test_gradient_mapped_through_sform(self):
+        vol = make_vol(dims=(3, 3, 3), data_fn=linear_fn,
+                       srow_x=(2, 0, 0, 10), srow_y=(0, 3, 0, 20),
+                       srow_z=(0, 0, 4, 30))
+        # world point of voxel (1, 1, 1)
+        _, _, grad = sample_point_gradient(vol, (12.0, 23.0, 34.0))
+        self.assertAlmostEqual(grad[0], 0.5)
+        self.assertAlmostEqual(grad[1], 10.0 / 3.0)
+        self.assertAlmostEqual(grad[2], 25.0)
+
+    def test_gradient_mapped_through_qform_rotation(self):
+        quat = (0.0, 0.0, math.sqrt(0.5))  # rotz(+90 deg)
+        vol = make_vol(dims=(3, 3, 3), data_fn=linear_fn, transform="qform",
+                       quatern=quat, qoffset=(10, 20, 30),
+                       pixdim=(1, 2, 3, 4))
+        # world = (-3j+10, 2i+20, 4k+30); voxel (1, 1, 1) -> (7, 22, 34)
+        _, _, grad = sample_point_gradient(vol, (7.0, 22.0, 34.0))
+        # quaternion round-off in the rebuilt rotation: compare to 6 places
+        self.assertAlmostEqual(grad[0], -10.0 / 3.0, places=6)
+        self.assertAlmostEqual(grad[1], 0.5, places=6)
+        self.assertAlmostEqual(grad[2], 25.0, places=6)
+
+    def test_gradient_neighbourhood_non_finite_flagged(self):
+        def nan_fn(i, j, k):
+            return float("nan") if (i, j, k) == (0, 1, 1) else linear_fn(i, j, k)
+        vol = make_vol(dims=(3, 3, 3), data_fn=nan_fn)
+        # intensity at the exact voxel centre reads only (1, 1, 1): finite
+        _, intensity = sample_point(vol, (1.0, 1.0, 1.0))
+        self.assertEqual(intensity, 111.0)
+        # ... but the x-gradient cell (0, 1) at j = k = 1 reaches (0, 1, 1)
+        with self.assertRaises(PointError) as ctx:
+            sample_point_gradient(vol, (1.0, 1.0, 1.0))
+        self.assertEqual(ctx.exception.code, "non_finite_data")
+        self.assertIn("(0, 1, 1)", str(ctx.exception))
+        self.assertEqual(ctx.exception.voxel, (1.0, 1.0, 1.0))
+
+    def test_gradient_zero_weight_neighbour_not_read(self):
+        def nan_fn(i, j, k):
+            return float("nan") if (i, j, k) == (0, 2, 1) else linear_fn(i, j, k)
+        vol = make_vol(dims=(3, 3, 3), data_fn=nan_fn)
+        # at (1, 1, 1) the y-stencil weight on j = 2 is zero: (0, 2, 1) unread
+        _, _, grad = sample_point_gradient(vol, (1.0, 1.0, 1.0))
+        self.assertEqual(grad, (1.0, 10.0, 100.0))
+
+    def test_gradient_out_of_bounds(self):
+        vol = make_vol()
+        with self.assertRaises(PointError) as ctx:
+            sample_point_gradient(vol, (-1.0, 0.0, 0.0))
+        self.assertEqual(ctx.exception.code, "out_of_bounds")
+        self.assertIsNotNone(ctx.exception.voxel)
 
 
 if __name__ == "__main__":

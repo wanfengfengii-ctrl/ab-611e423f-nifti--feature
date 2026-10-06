@@ -14,6 +14,7 @@
 | --- | --- |
 | 文件部分（任意字段名，须带 `filename`） | 单个 NIfTI-1 `.nii` 文件，≤ 16 MiB |
 | `points` 字段 | JSON 数组，1–256 个元素：`[{"id": 0, "point": [x, y, z]}, ...]` |
+| `derivatives` 字段（可选） | 设为 `world_gradient` 时，每个成功点追加世界坐标梯度 `gradient` |
 
 `id` 为 `[0, 2^31)` 内唯一整数；`point` 为三个有限数值（RAS 世界坐标，
 单位与文件仿射一致，通常为 mm）。
@@ -43,6 +44,25 @@ curl -F "file=@vol.nii" \
 `scl_slope`/`scl_inter` 缩放）、所用变换来源（`transform`，
 `sform` 或 `qform`）。越界点、非有限数据以**逐点错误**返回，不影响其余点。
 
+传入 `derivatives=world_gradient` 时，每个成功点额外包含 `gradient`
+`[dI/dR, dI/dA, dI/dS]`（按 R、A、S 顺序的有限值）：该点局部三线性强度场
+相对 RAS 世界坐标的变化率，已计入强度缩放并经所选 sform/qform 仿射映射
+（体素空间梯度 × 逆仿射的转置）：
+
+```json
+{"id": 1, "status": "ok", "voxel": [1.0, 2.0, 3.0],
+ "intensity": 647.0, "transform": "sform",
+ "gradient": [1.0, 6.6667, 50.0]}
+```
+
+三线性场在体素分界处仅分段线性，故点**恰**落在体素分界时取负体素侧单元
+求导（零侧边界改取正侧单元）；单体素轴的分量恒为 0。梯度所需邻域（求导轴
+上的相邻体素对 × 其余轴的插值支撑，零权重邻居不参与）触及非有限数据时，
+仅该点返回带 `voxel` 的 `non_finite_data` 逐点错误，其余点仍按请求顺序
+返回强度、体素坐标、变换来源与梯度。省略 `derivatives` 时响应不含
+`gradient` 字段；取值不是 `world_gradient` 时返回 400
+`invalid_derivatives`。
+
 ### 错误
 
 文件/请求级错误返回 4xx，JSON 形如
@@ -53,6 +73,7 @@ curl -F "file=@vol.nii" \
 | `invalid_multipart` | 400/415 | — | 表单结构非法 |
 | `missing_file` / `multiple_files` | 400 | `file` | 文件部分缺失/多于一个 |
 | `missing_points` / `invalid_points` | 400 | `points` | 坐标字段缺失、数量越界、id 重复/非法、坐标非有限（message 含点号） |
+| `invalid_derivatives` | 400 | `derivatives` | 字段存在但取值不是 `world_gradient` |
 | `file_too_large` | 413 | `file` | 超过 16 MiB |
 | `header_too_short` | 400 | `file` | 不足 348 字节头部 |
 | `bad_sizeof_hdr` | 400 | `sizeof_hdr` | 两种字节序下都不是 348 |
@@ -70,7 +91,7 @@ curl -F "file=@vol.nii" \
 | `singular_affine` | 400 | `srow`/`qform` | 所选仿射不可逆 |
 
 逐点错误（200 响应内）：`out_of_bounds`（逆变换后落在体素中心闭域
-`[0, n-1]` 之外）、`non_finite_data`（插值邻域内缩放后数据非有限）。
+`[0, n-1]` 之外）、`non_finite_data`（插值或梯度邻域内缩放后数据非有限）。
 
 ### `GET /healthz`
 
@@ -117,7 +138,7 @@ docker compose up --build --exit-code-from verify verify
 | --- | --- | --- |
 | bit0 | 1 | 代码测试（`tests/` 单元 + 集成测试） |
 | bit1 | 2 | 镜像构建校验（构建清单、运行时版本、模块导入、采样自检） |
-| bit2 | 4 | API 冒烟（大/小端 × sform/qform × int16/float32 样本矩阵 + 结构错误与逐点错误用例） |
+| bit2 | 4 | API 冒烟（大/小端 × sform/qform × int16/float32 样本矩阵、世界梯度与体素分界约定 + 结构错误与逐点错误用例） |
 
 退出码 0 表示全部通过。本地复现（stage 2 需要镜像构建清单
 `image-manifest.json`，仅在 Dockerfile 构建时生成）：
@@ -130,7 +151,7 @@ VERIFY_BASE_URL=http://127.0.0.1:8000 python -m verify.verify
 ## 目录结构
 
 ```
-app/            服务实现（server: HTTP/multipart；nifti: 头部解析校验；sampling: 插值）
+app/            服务实现（server: HTTP/multipart；nifti: 头部解析校验；sampling: 插值与世界梯度）
 tests/          单元与集成测试（stdlib unittest）
 verify/         一次性校验服务 + NIfTI 样本生成器 + multipart 客户端
 Dockerfile      单阶段镜像（python:3.11-slim，无外部依赖）

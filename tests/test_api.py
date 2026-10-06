@@ -129,6 +129,81 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error"]["code"], "non_finite_data")
 
+    # -- derivatives=world_gradient -------------------------------------------
+    def test_world_gradient_derivatives(self):
+        raw = sform_file(slope=2.0, inter=5.0)
+        points = [
+            {"id": 1, "point": world_of((1.0, 1.0, 1.0))},
+            {"id": 2, "point": world_of((0.5, 0.5, 0.5))},
+            {"id": 3, "point": world_of((-1.0, 0.0, 0.0))},
+        ]
+        status, payload = post_sample(self.base, raw, points,
+                                      derivatives="world_gradient")
+        self.assertEqual(status, 200)
+        r1, r2, r3 = payload["results"]
+        # sform diag(2, 3, 4); scaled voxel-space gradient is (2, 20, 200)
+        for r in (r1, r2):
+            self.assertEqual(r["status"], "ok")
+            self.assertEqual(len(r["gradient"]), 3)
+            self.assertAlmostEqual(r["gradient"][0], 1.0)
+            self.assertAlmostEqual(r["gradient"][1], 20.0 / 3.0)
+            self.assertAlmostEqual(r["gradient"][2], 50.0)
+        self.assertEqual(r3["status"], "error")
+        self.assertEqual(r3["error"]["code"], "out_of_bounds")
+        self.assertNotIn("gradient", r3)
+
+    def test_gradient_omitted_by_default(self):
+        status, payload = post_sample(
+            self.base, sform_file(),
+            [{"id": 1, "point": world_of((1.0, 1.0, 1.0))}])
+        self.assertEqual(status, 200)
+        (result,) = payload["results"]
+        self.assertEqual(result["status"], "ok")
+        self.assertNotIn("gradient", result)
+
+    def test_invalid_derivatives_value(self):
+        status, payload = post_sample(
+            self.base, sform_file(),
+            [{"id": 1, "point": world_of((1.0, 1.0, 1.0))}],
+            derivatives="hessian")
+        self.assert_error(status, payload, 400, "invalid_derivatives",
+                          "derivatives")
+
+    def test_multiple_derivatives_fields(self):
+        body = build_multipart(sform_file(), [{"id": 1, "point": [0, 0, 0]}],
+                               derivatives="world_gradient")
+        extra = (b"--" + BOUNDARY.encode() + b"\r\n"
+                 b'Content-Disposition: form-data; name="derivatives"\r\n\r\n'
+                 b"world_gradient\r\n")
+        body = body.replace(b"--" + BOUNDARY.encode() + b"--\r\n",
+                            extra + b"--" + BOUNDARY.encode() + b"--\r\n")
+        status, payload = self.post_raw(
+            body, f"multipart/form-data; boundary={BOUNDARY}")
+        self.assert_error(status, payload, 400, "invalid_multipart")
+
+    def test_gradient_non_finite_neighbour_per_point(self):
+        raw = sform_file(datatype="float32",
+                         data_fn=lambda i, j, k: float("nan")
+                         if (i, j, k) == (0, 1, 1) else data_fn(i, j, k))
+        points = [
+            {"id": 1, "point": world_of((1.0, 1.0, 1.0))},
+            {"id": 2, "point": world_of((3.0, 4.0, 5.0))},
+        ]
+        status, payload = post_sample(self.base, raw, points,
+                                      derivatives="world_gradient")
+        self.assertEqual(status, 200)
+        r1, r2 = payload["results"]
+        # id 1: intensity stencil is finite but the x-gradient cell hits NaN
+        self.assertEqual(r1["status"], "error")
+        self.assertEqual(r1["error"]["code"], "non_finite_data")
+        self.assertIn("voxel", r1["error"])
+        # id 2 keeps its intensity, voxel, transform and gradient
+        self.assertEqual(r2["status"], "ok")
+        self.assertEqual(r2["transform"], "sform")
+        self.assertAlmostEqual(r2["gradient"][0], 0.5)
+        self.assertAlmostEqual(r2["gradient"][1], 10.0 / 3.0)
+        self.assertAlmostEqual(r2["gradient"][2], 25.0)
+
     # -- structural errors -----------------------------------------------------
     def assert_error(self, status, payload, want_status, code, field=None):
         self.assertEqual(status, want_status, payload)

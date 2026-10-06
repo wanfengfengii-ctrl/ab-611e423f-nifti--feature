@@ -5,7 +5,8 @@ Aggregates three stages into the process exit code (bit flags):
 * bit 0 (1): unit/integration tests (``tests/``) failed
 * bit 1 (2): image build validation failed (manifest, runtime, imports)
 * bit 2 (4): API smoke failed (big/little endian x sform/qform x
-  int16/float32 sample matrix plus negative cases)
+  int16/float32 sample matrix, world-gradient and boundary-convention
+  checks, plus negative cases)
 
 Exit code 0 means every stage passed.  The smoke stage waits for the API
 service to report readiness on ``/healthz`` before sending traffic.
@@ -192,6 +193,8 @@ def stage_smoke(base_url):
         check(f"{tag}: request order preserved",
               [r.get("id") for r in results] == [3, 1, 4, 2, 5],
               repr([r.get("id") for r in results]))
+        check(f"{tag}: no gradient without derivatives",
+              all("gradient" not in r for r in results), repr(results))
         by_id = {r.get("id"): r for r in results}
         for pid in (1, 2, 3):
             r = by_id.get(pid, {})
@@ -211,6 +214,127 @@ def stage_smoke(base_url):
             check(f"{tag}: id {pid} out_of_bounds",
                   r.get("status") == "error"
                   and r.get("error", {}).get("code") == "out_of_bounds", repr(r))
+
+    # -- derivatives=world_gradient: scaling x endianness x transforms --------
+    # data_fn is linear with slope 2 applied, so the scaled voxel-space
+    # gradient is constantly (2, 20, 200); mapped through each affine:
+    expected_grad = {"sform": (1.0, 20.0 / 3.0, 50.0),
+                     "qform": (-20.0 / 3.0, 1.0, 50.0)}
+    for endian, transform, datatype in combos:
+        tag = f"{'LE' if endian == '<' else 'BE'}/{transform}/{datatype}"
+        affine = SFORM_AFFINE if transform == "sform" else QFORM_AFFINE
+        raw = build_nifti(
+            endian=endian, datatype=datatype, dims=DIMS, data_fn=data_fn,
+            transform=transform, slope=SLOPE, inter=INTER,
+            srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1], srow_z=SFORM_AFFINE[2],
+            quatern=QUATERN_90Z, qoffset=(10.0, 20.0, 30.0),
+            pixdim=(1.0, 2.0, 3.0, 4.0),
+        )
+        # exact interior boundary, mid-cell, and the top-corner boundary
+        voxels = {1: (1.0, 2.0, 3.0), 2: (0.5, 0.5, 0.5), 3: (3.0, 4.0, 5.0)}
+        points = [{"id": pid, "point": list(world_of(affine, v))}
+                  for pid, v in voxels.items()]
+        status, payload = post_sample(base_url, raw, points,
+                                      derivatives="world_gradient")
+        if not check(f"{tag}+grad: HTTP 200", status == 200,
+                     f"got {status}: {payload}"):
+            continue
+        results = payload.get("results") if isinstance(payload, dict) else None
+        by_id = {r.get("id"): r for r in results} \
+            if isinstance(results, list) else {}
+        want = expected_grad[transform]
+        for pid in (1, 2, 3):
+            r = by_id.get(pid, {})
+            grad = r.get("gradient")
+            ok = (r.get("status") == "ok" and isinstance(grad, list)
+                  and len(grad) == 3 and all(math.isfinite(g) for g in grad)
+                  and all(abs(g - w) <= 1e-3 for g, w in zip(grad, want)))
+            check(f"{tag}+grad: id {pid} world gradient", ok, repr(r))
+
+    # -- gradient cell conventions on exact voxel boundaries ------------------
+    # d(i^2)/di differs between neighbouring cells, so the chosen cell is
+    # observable in d/dR (slope 2 and pixdim 2 cancel out).
+    raw = build_nifti(endian=">", datatype="float32", dims=DIMS,
+                      data_fn=lambda i, j, k: i * i + 10 * j + 100 * k,
+                      transform="sform", slope=SLOPE, inter=INTER,
+                      srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1],
+                      srow_z=SFORM_AFFINE[2])
+    boundary_cases = [
+        ((2.0, 1.0, 1.0), 3.0),   # interior boundary -> negative cell (1, 2)
+        ((0.0, 1.0, 1.0), 1.0),   # zero boundary -> positive cell (0, 1)
+        ((3.0, 1.0, 1.0), 5.0),   # top boundary -> negative cell (2, 3)
+        ((1.5, 1.0, 1.0), 3.0),   # mid cell (1, 2)
+    ]
+    points = [{"id": n, "point": list(world_of(SFORM_AFFINE, v))}
+              for n, (v, _) in enumerate(boundary_cases, start=1)]
+    status, payload = post_sample(base_url, raw, points,
+                                  derivatives="world_gradient")
+    if check("grad boundaries: HTTP 200", status == 200,
+             f"got {status}: {payload}"):
+        results = payload.get("results") if isinstance(payload, dict) else []
+        by_id = {r.get("id"): r for r in results} \
+            if isinstance(results, list) else {}
+        for n, (v, want_x) in enumerate(boundary_cases, start=1):
+            r = by_id.get(n, {})
+            grad = r.get("gradient") or []
+            ok = (r.get("status") == "ok" and len(grad) == 3
+                  and abs(grad[0] - want_x) <= 1e-3
+                  and abs(grad[1] - 20.0 / 3.0) <= 1e-3
+                  and abs(grad[2] - 50.0) <= 1e-3)
+            check(f"grad boundaries: voxel {v} -> d/dR {want_x}", ok, repr(r))
+
+    # -- single-voxel axes have zero gradient components -----------------------
+    raw = build_nifti(endian="<", datatype="float32", dims=(3, 1, 1),
+                      data_fn=lambda i, j, k: i * i, transform="sform")
+    points = [{"id": 1, "point": [1.0, 0.0, 0.0]},
+              {"id": 2, "point": [2.0, 0.0, 0.0]}]
+    status, payload = post_sample(base_url, raw, points,
+                                  derivatives="world_gradient")
+    if check("grad single-voxel axes: HTTP 200", status == 200,
+             f"got {status}: {payload}"):
+        results = payload.get("results") if isinstance(payload, dict) else []
+        grads = {r.get("id"): r.get("gradient") for r in results} \
+            if isinstance(results, list) else {}
+        check("grad single-voxel axes: degenerate components are zero",
+              grads.get(1) == [1.0, 0.0, 0.0]
+              and grads.get(2) == [3.0, 0.0, 0.0], repr(payload))
+
+    # -- gradient neighbourhood with non-finite data fails only that point ----
+    raw = build_nifti(endian="<", datatype="float32", dims=DIMS,
+                      data_fn=lambda i, j, k: float("nan")
+                      if (i, j, k) == (0, 1, 1) else data_fn(i, j, k),
+                      transform="sform", slope=SLOPE, inter=INTER,
+                      srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1],
+                      srow_z=SFORM_AFFINE[2])
+    points = [{"id": 1, "point": list(world_of(SFORM_AFFINE, (1.0, 1.0, 1.0)))},
+              {"id": 2, "point": list(world_of(SFORM_AFFINE, (3.0, 4.0, 5.0)))}]
+    status, payload = post_sample(base_url, raw, points,
+                                  derivatives="world_gradient")
+    if check("grad non-finite: HTTP 200", status == 200,
+             f"got {status}: {payload}"):
+        results = payload.get("results") if isinstance(payload, dict) else []
+        by_id = {r.get("id"): r for r in results} \
+            if isinstance(results, list) else {}
+        r1, r2 = by_id.get(1, {}), by_id.get(2, {})
+        grad2 = r2.get("gradient") or []
+        check("grad non-finite: only the touching point errors",
+              r1.get("status") == "error"
+              and r1.get("error", {}).get("code") == "non_finite_data"
+              and "voxel" in r1.get("error", {})
+              and r2.get("status") == "ok"
+              and r2.get("transform") == "sform"
+              and len(grad2) == 3
+              and abs(grad2[0] - 1.0) <= 1e-3,
+              repr(payload))
+
+    # -- unsupported derivatives mode is rejected ------------------------------
+    status, payload = post_sample(base_url, raw, points[:1],
+                                  derivatives="hessian")
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    check("derivatives unsupported mode: 400/invalid_derivatives",
+          status == 400 and err.get("code") == "invalid_derivatives"
+          and err.get("field") == "derivatives",
+          f"got {status}: {payload}")
 
     # -- negative file-structure cases --------------------------------------
     base = dict(endian="<", datatype="float32", dims=DIMS, data_fn=data_fn,

@@ -2,6 +2,8 @@
 
 The multipart form carries exactly one NIfTI-1 .nii file (<= 16 MiB) and a
 ``points`` JSON field with 1..256 uniquely-numbered finite 3D coordinates.
+An optional ``derivatives=world_gradient`` field adds a per-point RAS world
+gradient of the trilinear intensity field to every successful result.
 See README.md for the full API contract.
 """
 from __future__ import annotations
@@ -15,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .errors import ApiError, PointError
 from .nifti import NiftiVolume, parse_nifti
-from .sampling import sample_point
+from .sampling import sample_point, sample_point_gradient
 
 log = logging.getLogger("nifti_sampler")
 
@@ -276,6 +278,19 @@ class Handler(BaseHTTPRequestHandler):
                            field="points")
         if len(point_parts) > 1:
             raise ApiError("invalid_multipart", "multiple 'points' fields")
+        deriv_parts = [p for p in parts if p.name == "derivatives"
+                       and p.filename is None]
+        if len(deriv_parts) > 1:
+            raise ApiError("invalid_multipart", "multiple 'derivatives' fields")
+        want_gradient = False
+        if deriv_parts:
+            mode = deriv_parts[0].content.decode("utf-8", "replace").strip()
+            if mode != "world_gradient":
+                raise ApiError("invalid_derivatives",
+                               f"derivatives={mode!r}; the only supported value "
+                               f"is 'world_gradient'",
+                               field="derivatives")
+            want_gradient = True
 
         content = files[0].content
         if len(content) > MAX_FILE_BYTES:
@@ -290,7 +305,12 @@ class Handler(BaseHTTPRequestHandler):
         results = []
         for pid, coord in points:
             try:
-                voxel, intensity = sample_point(volume, coord)
+                if want_gradient:
+                    voxel, intensity, gradient = \
+                        sample_point_gradient(volume, coord)
+                else:
+                    voxel, intensity = sample_point(volume, coord)
+                    gradient = None
             except PointError as err:
                 entry = {"id": pid, "status": "error",
                          "error": {"code": err.code, "message": err.message}}
@@ -298,9 +318,12 @@ class Handler(BaseHTTPRequestHandler):
                     entry["error"]["voxel"] = list(err.voxel)
                 results.append(entry)
             else:
-                results.append({"id": pid, "status": "ok",
-                                "voxel": list(voxel), "intensity": intensity,
-                                "transform": volume.transform})
+                entry = {"id": pid, "status": "ok",
+                         "voxel": list(voxel), "intensity": intensity,
+                         "transform": volume.transform}
+                if gradient is not None:
+                    entry["gradient"] = list(gradient)
+                results.append(entry)
         self._send_json(200, {"transform": volume.transform, "results": results})
 
 
@@ -324,6 +347,10 @@ def self_check():
     (_, center) = sample_point(vol, (0.5, 0.5, 0.5))
     if abs(center - 3.5) > 1e-12:
         raise RuntimeError(f"self-check center sample failed: {center}")
+    # data(i, j, k) = i + 2j + 4k on the identity affine -> gradient (1, 2, 4)
+    (_, _, grad) = sample_point_gradient(vol, (1.0, 1.0, 1.0))
+    if grad != (1.0, 2.0, 4.0):
+        raise RuntimeError(f"self-check gradient failed: {grad}")
 
 
 def main():
